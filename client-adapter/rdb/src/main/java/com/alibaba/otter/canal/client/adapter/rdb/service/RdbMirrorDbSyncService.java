@@ -35,10 +35,11 @@ public class RdbMirrorDbSyncService {
     private RdbSyncService              rdbSyncService;                                                // rdbSyncService代理
 
     public RdbMirrorDbSyncService(Map<String, MirrorDbConfig> mirrorDbConfigCache, DataSource dataSource,
-                                  Integer threads, Map<String, Map<String, Integer>> columnsTypeCache){
+                                  Integer threads, Map<String, Map<String, Integer>> columnsTypeCache,
+                                  boolean skipDupException){
         this.mirrorDbConfigCache = mirrorDbConfigCache;
         this.dataSource = dataSource;
-        this.rdbSyncService = new RdbSyncService(dataSource, threads, columnsTypeCache);
+        this.rdbSyncService = new RdbSyncService(dataSource, threads, columnsTypeCache, skipDupException);
     }
 
     /**
@@ -55,6 +56,15 @@ public class RdbMirrorDbSyncService {
             if (mirrorDbConfig == null) {
                 continue;
             }
+            if (mirrorDbConfig.getMappingConfig() == null) {
+                continue;
+            }
+            if (dml.getGroupId() != null && StringUtils.isNotEmpty(mirrorDbConfig.getMappingConfig().getGroupId())) {
+                if (!mirrorDbConfig.getMappingConfig().getGroupId().equals(dml.getGroupId())) {
+                    continue; // 如果groupId不匹配则过滤
+                }
+            }
+
             if (dml.getIsDdl() != null && dml.getIsDdl() && StringUtils.isNotEmpty(dml.getSql())) {
                 // DDL
                 if (logger.isDebugEnabled()) {
@@ -116,6 +126,7 @@ public class RdbMirrorDbSyncService {
             mappingConfig = new MappingConfig();
             mappingConfig.setDataSourceKey(baseConfigMap.getDataSourceKey());
             mappingConfig.setDestination(baseConfigMap.getDestination());
+            mappingConfig.setGroupId(baseConfigMap.getGroupId());
             mappingConfig.setOuterAdapterKey(baseConfigMap.getOuterAdapterKey());
             mappingConfig.setConcurrent(baseConfigMap.getConcurrent());
             MappingConfig.DbMapping dbMapping = new MappingConfig.DbMapping();
@@ -148,7 +159,7 @@ public class RdbMirrorDbSyncService {
                 logger.trace("Execute DDL sql: {} for database: {}", ddl.getSql(), ddl.getDatabase());
             }
         } catch (Exception e) {
-            logger.error(e.getMessage(), e);
+            throw new RuntimeException(e);
         }
     }
 }

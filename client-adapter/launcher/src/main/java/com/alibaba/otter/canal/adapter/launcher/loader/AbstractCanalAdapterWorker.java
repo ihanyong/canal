@@ -2,7 +2,9 @@ package com.alibaba.otter.canal.adapter.launcher.loader;
 
 import java.util.ArrayList;
 import java.util.List;
-import java.util.concurrent.*;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -14,6 +16,7 @@ import com.alibaba.otter.canal.client.adapter.OuterAdapter;
 import com.alibaba.otter.canal.client.adapter.support.CanalClientConfig;
 import com.alibaba.otter.canal.client.adapter.support.Dml;
 import com.alibaba.otter.canal.client.adapter.support.MessageUtil;
+import com.alibaba.otter.canal.client.adapter.support.Util;
 import com.alibaba.otter.canal.protocol.FlatMessage;
 import com.alibaba.otter.canal.protocol.Message;
 
@@ -28,6 +31,7 @@ public abstract class AbstractCanalAdapterWorker {
     protected final Logger                    logger  = LoggerFactory.getLogger(this.getClass());
 
     protected String                          canalDestination;                                                // canal实例
+    protected String                          groupId = null;                                                  // groupId
     protected List<List<OuterAdapter>>        canalOuterAdapters;                                              // 外部适配器
     protected CanalClientConfig               canalClientConfig;                                               // 配置
     protected ExecutorService                 groupInnerExecutorService;                                       // 组内工作线程池
@@ -39,7 +43,7 @@ public abstract class AbstractCanalAdapterWorker {
 
     public AbstractCanalAdapterWorker(List<List<OuterAdapter>> canalOuterAdapters){
         this.canalOuterAdapters = canalOuterAdapters;
-        this.groupInnerExecutorService = Executors.newFixedThreadPool(canalOuterAdapters.size());
+        this.groupInnerExecutorService = Util.newFixedThreadPool(canalOuterAdapters.size(), 5000L);
         syncSwitch = (SyncSwitch) SpringContext.getBean(SyncSwitch.class);
     }
 
@@ -53,7 +57,7 @@ public abstract class AbstractCanalAdapterWorker {
                     // 组内适配器穿行运行，尽量不要配置组内适配器
                     adapters.forEach(adapter -> {
                         long begin = System.currentTimeMillis();
-                        List<Dml> dmls = MessageUtil.parse4Dml(canalDestination, message);
+                        List<Dml> dmls = MessageUtil.parse4Dml(canalDestination, groupId, message);
                         if (dmls != null) {
                             batchSync(dmls, adapter);
 
@@ -73,16 +77,19 @@ public abstract class AbstractCanalAdapterWorker {
 
             // 等待所有适配器写入完成
             // 由于是组间并发操作，所以将阻塞直到耗时最久的工作组操作完成
-            futures.forEach(future -> {
+            RuntimeException exception = null;
+            for (Future<Boolean> future : futures) {
                 try {
                     if (!future.get()) {
-                        throw new RuntimeException("Outer adapter sync failed! ");
+                        exception = new RuntimeException("Outer adapter sync failed! ");
                     }
                 } catch (Exception e) {
-                    future.cancel(true);
-                    throw new RuntimeException(e);
+                    exception = new RuntimeException(e);
                 }
-            });
+            }
+            if (exception != null) {
+                throw exception;
+            }
         });
     }
 
@@ -95,7 +102,7 @@ public abstract class AbstractCanalAdapterWorker {
                     // 组内适配器穿行运行，尽量不要配置组内适配器
                     outerAdapters.forEach(adapter -> {
                         long begin = System.currentTimeMillis();
-                        List<Dml> dmls = MessageUtil.flatMessage2Dml(canalDestination, flatMessages);
+                        List<Dml> dmls = MessageUtil.flatMessage2Dml(canalDestination, groupId, flatMessages);
                         batchSync(dmls, adapter);
 
                         if (logger.isDebugEnabled()) {
@@ -113,22 +120,25 @@ public abstract class AbstractCanalAdapterWorker {
 
             // 等待所有适配器写入完成
             // 由于是组间并发操作，所以将阻塞直到耗时最久的工作组操作完成
-            futures.forEach(future -> {
+            RuntimeException exception = null;
+            for (Future<Boolean> future : futures) {
                 try {
                     if (!future.get()) {
-                        throw new RuntimeException("Outer adapter sync failed! ");
+                        exception = new RuntimeException("Outer adapter sync failed! ");
                     }
                 } catch (Exception e) {
-                    future.cancel(true);
-                    throw new RuntimeException(e);
+                    exception = new RuntimeException(e);
                 }
-            });
+            }
+            if (exception != null) {
+                throw exception;
+            }
         });
     }
 
     @SuppressWarnings("unchecked")
-    protected boolean mqWriteOutData(int retry, long timeout, int i, final boolean flatMessage, CanalMQConnector connector,
-                                  ExecutorService workerExecutor) {
+    protected boolean mqWriteOutData(int retry, long timeout, int i, final boolean flatMessage,
+                                     CanalMQConnector connector, ExecutorService workerExecutor) {
         try {
             List<?> messages;
             if (!flatMessage) {
@@ -141,6 +151,9 @@ public abstract class AbstractCanalAdapterWorker {
                     if (flatMessage) {
                         // batch write
                         writeOut((List<FlatMessage>) messages);
+                        // FIXME xxx
+                        // messages.forEach((message ->
+                        // System.out.println(JSON.toJSONString(message))));
                     } else {
                         for (final Object message : messages) {
                             writeOut((Message) message);
@@ -157,7 +170,7 @@ public abstract class AbstractCanalAdapterWorker {
                 }
                 connector.ack();
             }
-           return true;
+            return true;
         } catch (Throwable e) {
             if (i == retry - 1) {
                 connector.ack();
@@ -173,7 +186,7 @@ public abstract class AbstractCanalAdapterWorker {
                 // ignore
             }
         }
-        return  false;
+        return false;
     }
 
     /**
@@ -191,7 +204,11 @@ public abstract class AbstractCanalAdapterWorker {
             List<Dml> dmlsBatch = new ArrayList<>();
             for (Dml dml : dmls) {
                 dmlsBatch.add(dml);
-                len += dml.getData().size();
+                if (dml.getData() == null || dml.getData().isEmpty()) {
+                    len += 1;
+                } else {
+                    len += dml.getData().size();
+                }
                 if (len >= canalClientConfig.getSyncBatchSize()) {
                     adapter.sync(dmlsBatch);
                     dmlsBatch.clear();
